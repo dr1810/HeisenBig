@@ -1,0 +1,25 @@
+# Pinned so every teammate gets an identical environment.
+# torch is installed separately in the Dockerfile from the CPU wheel index.
+
+# --- ENDF / ACE nuclear data I/O (see docs/reference/endfpythoninterface.pdf)
+endf==0.1.12
+uncertainties==3.2.3
+
+# --- Stage 1: ETL (Spark -> Parquet / HDFS)
+pyspark==4.3.0
+pyarrow==26.0.1
+
+# --- Stage 2: distributed non-linear compression
+ray[default,train,tune]==2.60.0
+
+# --- Numerics / analysis
+numpy==2.5.5
+scipy==1.18.1
+pandas==3.1.1
+matplotlib==3.11.2
+
+# --- Notebooks & testing
+jupyterlab==4.6.6
+nbconvert
+ipykernel
+pytest

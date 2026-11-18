@@ -1,0 +1,59 @@
+# HeisenBig shared dev environment
+#
+#   docker compose up -d --build             # JupyterLab only (local filesystem)
+#   docker compose --profile hdfs up -d      # + single-node HDFS (namenode + datanode)
+#
+# JupyterLab    http://localhost:8888
+# Spark UI      http://localhost:4040   (while a SparkSession is alive)
+# Ray dashboard http://localhost:8265   (after ray.init(include_dashboard=True, dashboard_host="0.0.0.0"))
+# HDFS UI       http://localhost:9870   (hdfs profile)
+
+x-hdfs-common: &hdfs-common
+  build:
+    context: .
+    dockerfile: docker/hdfs/Dockerfile
+  image: heisenbig/hdfs:3.4.2
+  profiles: ["hdfs"]
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: heisenbig/dev:latest
+    container_name: heisenbig-dev
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+      - "8265:8265"
+    volumes:
+      - ./:/workspace
+    environment:
+      HEISENBIG_DATA: /workspace/data
+      HDFS_URL: hdfs://namenode:9000
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+    shm_size: "2gb"   # Ray object store + PyTorch DataLoader workers need /dev/shm
+
+  namenode:
+    <<: *hdfs-common
+    container_name: heisenbig-namenode
+    hostname: namenode
+    command: ["namenode"]
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - hdfs-name:/hadoop/dfs/name
+
+  datanode:
+    <<: *hdfs-common
+    container_name: heisenbig-datanode
+    hostname: datanode
+    command: ["datanode"]
+    depends_on: [namenode]
+    volumes:
+      - hdfs-data:/hadoop/dfs/data
+
+volumes:
+  hdfs-name:
+  hdfs-data:
