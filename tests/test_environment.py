@@ -60,3 +60,26 @@ def test_ray_local():
         assert sum(ray.get([sq.remote(i) for i in range(10)])) == 285
     finally:
         ray.shutdown()
+
+
+def test_sklearn_pca_baseline():
+    from sklearn.decomposition import PCA
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(200, 3)) @ rng.normal(size=(3, 50))  # rank-3 data
+    pca = PCA(n_components=3).fit(x)
+    assert pca.explained_variance_ratio_.sum() > 0.999
+
+
+def test_seaborn_and_tqdm():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import pandas as pd
+    import seaborn as sns
+    from tqdm.auto import tqdm
+
+    df = pd.DataFrame({"e": np.arange(10), "xs": np.arange(10) ** 2})
+    ax = sns.lineplot(data=df, x="e", y="xs")
+    assert ax is not None
+    assert sum(tqdm(range(5), disable=True)) == 10

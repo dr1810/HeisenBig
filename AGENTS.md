@@ -61,7 +61,7 @@ docker compose exec dev pytest -q      # environment smoke tests
 
 Stack inside `heisenbig/dev` (pinned in `docker/requirements.txt`):
 Python 3.12 · OpenJDK 17 · PySpark 4.3 (local mode) · PyTorch 2.15 CPU · Ray 2.60 · endf 0.1.12 ·
-numpy/scipy/pandas/pyarrow/matplotlib · JupyterLab. Repo is bind-mounted at `/workspace`.
+numpy/scipy/pandas/pyarrow/matplotlib/seaborn · scikit-learn (PCA/SVD baselines) · tqdm · JupyterLab. Repo is bind-mounted at `/workspace`.
 
 Rules for agents:
 - **Run code inside the container** (`docker compose exec dev …`), not on the host — host Python
