@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration>
+  <property><name>fs.defaultFS</name><value>hdfs://namenode:9000</value></property>
+  <!-- Let the 'dev' user in the dev container write without Kerberos/permissions setup -->
+  <property><name>hadoop.http.staticuser.user</name><value>root</value></property>
+</configuration>
