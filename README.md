@@ -37,3 +37,32 @@ In code, use `from heisenbig.spark import get_spark` and call `get_spark(hdfs=Tr
 | 9870 | HDFS NameNode UI (`hdfs` profile) |
 
 To add a Python dependency, pin it in `docker/requirements.txt`, then run `docker compose build`.
+
+## Thin end-to-end pipeline
+
+A minimal version of all four stages. It runs on the ENDF files from `scripts/download_endf.sh` and needs nothing else.
+
+| Stage | Module | What it does |
+|---|---|---|
+| 1 ETL | `heisenbig.etl` | Spark parses each ENDF file in a worker and writes MF=3 σ(E) for MT 1/2/18/102 to long Parquet `xs_long/`, partitioned by nuclide |
+| 2 Grid + compression | `heisenbig.grid`, `heisenbig.compress` | Resamples every curve onto a shared 2000-point log grid (1e-5 eV–20 MeV) with ENDF interpolation laws, writes `xs_wide/`, and fits PCA on log10(σ) |
+| 3 UQ | `heisenbig.uq` | One-group k∞ of a homogenised 4 % UO₂ + water mix, with Monte Carlo in PCA latent space vs full grid space, distributed with Spark |
+| 4 Analysis | `notebooks/01_thin_e2e.ipynb` | Plots the saved outputs: curves, PCA error vs k, and k∞ histograms |
+
+```bash
+bash scripts/run_thin_e2e.sh --quick   # 8 nuclides, N=500, 400 samples → data/processed/quick/  (~20 s)
+bash scripts/run_thin_e2e.sh           # all 558 files, N=2000, 2000 samples → data/processed/  (~1.5 min)
+bash scripts/run_thin_e2e.sh --help    # --nuclides, --n-grid, --n-samples, --k, --hdfs, --out
+
+docker compose exec dev pytest -q tests/test_pipeline.py
+docker compose exec -w /workspace/notebooks dev \
+  jupyter nbconvert --to notebook --execute --inplace 01_thin_e2e.ipynb
+```
+
+The script runs inside the dev container; it calls `docker compose exec` for you when started on the host.
+With `--hdfs`, start HDFS first and wait for it: `docker compose --profile hdfs up -d && docker compose exec namenode hdfs dfsadmin -safemode wait`.
+
+**Limitations of this version**
+- **Absolute k∞ is not physical yet.** ENDF MF=3 holds only a background in the resolved resonance region. U-235 fission and capture are exactly zero below 2.24 keV, so thermal fission is missing entirely. Dense pointwise data (POINT2025 or ACE) will replace MF=3 later.
+- **ν̄** is read from ENDF MF=1/MT=452 for U-235 and U-238. The constants 2.43 and 2.8 are only used if that read fails; they are not used in the current runs.
+- **The flux spectrum is an analytic shape**, not a transport solution. Details and the decisions log are in [AGENTS.md](AGENTS.md) §8.

@@ -30,10 +30,16 @@ safety-relevant quantities.
 AGENTS.md              ← this file (CLAUDE.md just points here)
 docker-compose.yml     ← shared environment (dev container + optional HDFS)
 docker/                ← Dockerfile, pinned requirements, HDFS image/config
-scripts/               ← data download scripts (data is never committed)
-notebooks/             ← exploration; 00_endf_docs_smoke_test.ipynb verifies the env
+scripts/               ← data download scripts; run_thin_e2e.sh (pipeline entry point)
+notebooks/             ← 00_endf_docs_smoke_test (env check), 01_thin_e2e (stage 4 analysis)
 src/heisenbig/         ← importable project code (PYTHONPATH=/workspace/src in container)
-tests/                 ← pytest; tests/test_environment.py = env smoke test
+  spark.py             ← get_spark(hdfs=...) SparkSession factory
+  etl.py               ← stage 1: ENDF files → long Parquet (Spark, one task per file)
+  grid.py              ← stage 2a: shared log grid + resampling via Tabulated1D (applyInPandas)
+  compress.py          ← stage 2b: Compressor interface (encode/decode) + PCA baseline
+  uq.py                ← stage 3: k_inf figure of merit, reference flux, Spark MC (latent vs full)
+  pipeline.py          ← `python -m heisenbig.pipeline [--quick] [--hdfs]` runs stages 1→3
+tests/                 ← pytest; test_environment.py (env), test_pipeline.py (pipeline)
 docs/                  ← longer background notes
 data/                  ← git-ignored. raw/, processed/, downloads/
 ```
@@ -44,7 +50,8 @@ Data layout (after running the scripts):
 |---|---|
 | `data/raw/endf-b8.1/neutrons/n-ZZZ_Sy_AAA.endf` | 558 ENDF-6 neutron sublibrary files (~1.3 GB) |
 | `data/raw/ace/80198.710nc` | One sample ACE table (Hg-198, ENDF/B-VII.1, 293.6 K) |
-| `data/processed/` | Parquet outputs of the pipeline (convention, create as needed) |
+| `data/processed/` | Full pipeline outputs (see `pipeline.py` docstring for the file list) |
+| `data/processed/quick/` | `--quick` run outputs (kept separate so they never overwrite the full run) |
 
 ---
 
@@ -190,22 +197,60 @@ Docs: https://endf-python.readthedocs.io
 
 ---
 
-## 7. Data-engineering conventions (stage 1 target schema, proposed)
+## 7. Data-engineering conventions (implemented in the thin pipeline)
 
 Long/tidy Parquet partitioned by nuclide, one row per (nuclide, MT, temperature, energy):
 
 ```
 za:int, nuclide:str, mat:int, mt:int, reaction:str, temperature_k:float,
-energy_ev:double, xs_barn:double, interp_law:int, source:str ('endf'|'ace'|'point')
+energy_ev:double, xs_barn:double, interp_law:int, source:str ('endf'|'ace'|'point'), idx:int
 ```
 
-Wide matrices for ML (stage 2) are derived by resampling each σ(E) onto a shared log-uniform
-(or union) energy grid — keep the resampled grid definition versioned in code.
+`idx` is the point's position within its curve. ENDF repeats an energy at discontinuities, so
+order by `idx`, never by `energy_ev`. `interp_law` is the law of the interval *ending* at that
+point; `etl.arrays_to_tab` rebuilds an equivalent `Tabulated1D` from (energy, xs, interp_law).
+
+Wide table (`xs_wide/`): one row per (nuclide, MT) with metadata + `n_points` + `xs`, an
+`array<double>` of length N whose element j is σ at grid energy j. Grid definition is in
+`xs_wide_grid.json` (emin, emax, n, energies).
 
 ---
 
 ## 8. Open questions / decisions log
 
+Open:
 - Dense pointwise source: POINT2025 vs ACE Lib81 vs reconstruct ourselves (openmc). *Undecided.*
+  POINT2025 293.6 K was spot-checked: it parses directly with `endf.Material` and has 40–1,900×
+  more points than MF=3 (e.g. U-238 MT102: 110 → 211,133). Leading candidate.
 - UQ figure of merit: k∞ proxy vs real transport (OpenMC). *Undecided.*
 - Cluster target: local Docker for dev; course cluster (Dataproc/HPC) for scale runs. *TBD.*
+- Compressor: PCA is a weak fit for these curves (see below). Autoencoder via the `Compressor`
+  interface is the next step; also consider masking/handling exact zeros separately.
+
+Decisions (thin end-to-end pipeline, branch `feat/thin-e2e`, 2026-11-25):
+- **Data**: thin version uses ENDF MF=3 at 0 K, MT 1/2/18/102 only. MF=3 is only a background
+  in the RRR, e.g. U-235 MT18/102 are exactly 0 from 1e-5 eV to 2.24 keV. Absolute k∞ is
+  therefore not physical; the pipeline is built so a pointwise source can replace stage 1 input.
+- **ETL**: Spark parallelises over file paths; each task parses one file and emits one record
+  per curve with arrays, which Spark explodes (avoids millions of Python Row objects). Failures
+  are logged to `etl_errors.json`, not fatal. All 558 files currently parse.
+- **Grid**: log-uniform, 1e-5 eV–20 MeV, N=2000 (quick: 500). Values outside a curve's range
+  are 0. Wide rows store σ as an array column, not 2000 separate columns.
+- **Features**: log10(σ + 1e-10). Zeros become −10, which creates cliffs PCA handles poorly.
+- **PCA**: fitted once with up to 64 components; error = per-curve relative L2 in linear σ.
+  `choose_k` = smallest k with median error ≤ 1 %, else the largest k. On the full run nothing
+  meets 1 % (k=64 median 30 %), so k=64 is chosen.
+- **Figure of merit**: one-group k∞ = Σ N ν̄σf / Σ N (σf + σc) for homogenised 4 % UO₂ + water
+  (fuel/water volume 0.35/0.65, cold densities; derivation in `uq.py`). ν̄(E) is read from
+  MF=1/MT=452 for U-235/U-238 (constants 2.43 / 2.8 are only a fallback). The reference flux is an
+  analytic Maxwellian + 1/E + Watt mix (25/35/40 % of flux), not a transport solution.
+- **MC**: both schemes are calibrated to ~0.75 % RMS relative σ perturbation and applied to the
+  MT18/MT102 rows of U235/U238/H1/O16. Latent: isotropic Gaussian with σ_z = 0.0075/ln10·√(N/k).
+  Full space: squared-exponential correlation in log10 E, length 0.5 decades, factor via `eigh`
+  (its cost is included in full-space timing). One Spark task per batch of 250 samples, seeded by
+  (seed, method, batch) so results do not depend on partitioning. They are identical on local FS
+  and HDFS.
+- **HDFS**: `--hdfs` puts the Parquet datasets under `/heisenbig/<out-name>/`; JSON and model
+  artifacts stay local. After `--profile hdfs up`, run
+  `docker compose exec namenode hdfs dfsadmin -safemode wait` before writing, or the namenode
+  rejects writes while still in safe mode.
