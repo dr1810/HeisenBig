@@ -114,3 +114,38 @@ def choose_k(rows: list[dict], target_median: float = 0.01) -> int:
         if r["median_rel_err"] <= target_median:
             return r["k"]
     return rows[-1]["k"]
+
+
+def choose_k_tolerance(rows: list[dict], key: str = "median_rel_err",
+                       target: float = 0.01, rel_tol: float = 0.10) -> int:
+    """Smallest k that meets ``target``, or failing that is within ``rel_tol`` of the
+    best k. Used when every k plateaus above the absolute target (e.g. the AE), where
+    "largest k" would waste latent dimensions for no gain."""
+    best = min(r[key] for r in rows)
+    threshold = max(target, best * (1 + rel_tol))
+    return min(r["k"] for r in rows if r[key] <= threshold)
+
+
+def train_val_split(nuclides, val_frac: float = 0.2, seed: int = 0,
+                    force_train=()) -> tuple[np.ndarray, np.ndarray]:
+    """Random row split (indices). Rows of ``force_train`` nuclides always go to
+    training, because stage 3 encodes exactly those rows."""
+    nuclides = np.asarray(nuclides)
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(nuclides))
+    forced = np.isin(nuclides[idx], list(force_train))
+    pool = idx[~forced]
+    n_val = int(round(val_frac * len(nuclides)))
+    val = np.sort(pool[:n_val])
+    train = np.sort(np.setdiff1d(idx, val))
+    return train, val
+
+
+def heldout_row(name: str, k: int, model, xs_train: np.ndarray, xs_val: np.ndarray, **extra) -> dict:
+    """Reconstruction metrics for one (compressor, k) on the shared split."""
+    ev = relative_errors(xs_val, model.decode(model.encode(xs_val)))
+    et = relative_errors(xs_train, model.decode(model.encode(xs_train)))
+    return {"compressor": name, "k": k,
+            "val_median_rel_err": float(np.median(ev)), "val_mean_rel_err": float(ev.mean()),
+            "val_p90_rel_err": float(np.quantile(ev, 0.9)),
+            "train_median_rel_err": float(np.median(et))} | extra

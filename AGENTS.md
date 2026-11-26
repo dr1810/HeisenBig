@@ -36,7 +36,8 @@ src/heisenbig/         ← importable project code (PYTHONPATH=/workspace/src in
   spark.py             ← get_spark(hdfs=...) SparkSession factory
   etl.py               ← stage 1: ENDF files → long Parquet (Spark, one task per file)
   grid.py              ← stage 2a: shared log grid + resampling via Tabulated1D (applyInPandas)
-  compress.py          ← stage 2b: Compressor interface (encode/decode) + PCA baseline
+  compress.py          ← stage 2b: Compressor interface (encode/decode) + PCA baseline, split helpers
+  autoencoder.py       ← stage 2b option: masked MLP autoencoder + Ray sweep over k (--compressor ae)
   uq.py                ← stage 3: k_inf figure of merit, reference flux, Spark MC (latent vs full)
   pipeline.py          ← `python -m heisenbig.pipeline [--quick] [--hdfs]` runs stages 1→3
 tests/                 ← pytest; test_environment.py (env), test_pipeline.py (pipeline)
@@ -224,8 +225,10 @@ Open:
   more points than MF=3 (e.g. U-238 MT102: 110 → 211,133). Leading candidate.
 - UQ figure of merit: k∞ proxy vs real transport (OpenMC). *Undecided.*
 - Cluster target: local Docker for dev; course cluster (Dataproc/HPC) for scale runs. *TBD.*
-- Compressor: PCA is a weak fit for these curves (see below). Autoencoder via the `Compressor`
-  interface is the next step; also consider masking/handling exact zeros separately.
+- Compressor: the masked AE beats PCA on reconstruction (below), but its nominal k∞ bias is
+  larger (−0.061 vs PCA +0.038) because it underestimates the flux-weighted U-238 σf and σc.
+  Candidates: a flux-importance-weighted loss, more epochs (best checkpoints sit at the end of
+  training), and re-checking on dense POINT2025 data, where the curve structure differs.
 
 Decisions (thin end-to-end pipeline, branch `feat/thin-e2e`, 2026-11-25):
 - **Data**: thin version uses ENDF MF=3 at 0 K, MT 1/2/18/102 only. MF=3 is only a background
@@ -245,11 +248,38 @@ Decisions (thin end-to-end pipeline, branch `feat/thin-e2e`, 2026-11-25):
   MF=1/MT=452 for U-235/U-238 (constants 2.43 / 2.8 are only a fallback). The reference flux is an
   analytic Maxwellian + 1/E + Watt mix (25/35/40 % of flux), not a transport solution.
 - **MC**: both schemes are calibrated to ~0.75 % RMS relative σ perturbation and applied to the
-  MT18/MT102 rows of U235/U238/H1/O16. Latent: isotropic Gaussian with σ_z = 0.0075/ln10·√(N/k).
-  Full space: squared-exponential correlation in log10 E, length 0.5 decades, factor via `eigh`
-  (its cost is included in full-space timing). One Spark task per batch of 250 samples, seeded by
-  (seed, method, batch) so results do not depend on partitioning. They are identical on local FS
-  and HDFS.
+  MT18/MT102 rows of U235/U238/H1/O16. Full space: squared-exponential correlation in log10 E,
+  length 0.5 decades, factor via `eigh` (its cost is included in full-space timing). One Spark task
+  per batch of 250 samples, seeded by (seed, method, batch) so results do not depend on
+  partitioning. They are identical on local FS and HDFS. (Latent scheme: see the AE decisions below;
+  PR #2 used an isotropic σ_z = 0.0075/ln10·√(N/k) instead.)
+
+Decisions (autoencoder option, branch `feat/autoencoder`, 2026-11-26):
+- **Option, not default**: `--compressor ae` adds the AE; PCA alone stays the default. PCA-only
+  runs delete a stale `compressor_comparison.json` / `models/ae.pt` from the output dir.
+- **Model**: MLP 2N → 512 → 256 → k → 256 → 512 → 2N. Input is [standardised log10 σ (0 where
+  σ = 0) | presence mask]. Outputs are [mask logits | log-values]. Loss is BCE(mask) + MSE(log-value
+  where σ > 0). Decoding gives exactly 0 where logit ≤ 0 and clips log-values to the training range.
+  A 1-D conv AE was tried first and dropped: ~9 s/epoch on CPU vs ~1 s for the MLP.
+- **Training**: AdamW + OneCycle (peak 2e-3), batch 64, 150 epochs. A validation check every 10
+  epochs keeps the best checkpoint by held-out median error. The torch seed is set *before* the
+  network is built; otherwise weight init depends on process RNG state and runs differ.
+- **Fair comparison**: a shared 80/20 row split (seed 0). The reactor nuclides' rows are forced
+  into training, because stage 3 encodes them. PCA is refit on the training split for the table,
+  `compressor_comparison.json`. If no rows can be held out (e.g. `--nuclides` with only reactor
+  nuclides), it falls back to in-sample evaluation and records `"in_sample": true`.
+- **AE k**: `choose_k_tolerance` = smallest k meeting 1 %, else within 10 % of the best held-out
+  median. "Largest k" would waste dimensions on a plateau. Full run → k=8.
+- **Ray**: one Ray task per k (CPUs split evenly), run in a *spawned child process*. Starting Ray
+  inside the Spark driver process breaks Py4J (ConnectionResetError on the next Spark call, even
+  without `ray.shutdown()`).
+- **Latent MC (all compressors)**: perturb z0 + c·s∘ε, where s is the per-dimension std of the
+  compressor's codes over all rows. The scalar c is calibrated empirically (fixed-point on a fixed
+  draw) to the target RMS relative σ perturbation, since AE latent units are arbitrary. This also
+  changes the PCA latent MC: std 0.0018 (PR #2, isotropic) → 0.0043, now comparable to full space
+  (0.0040).
+- **Spark workers** decode the AE with `torch.set_num_threads(1)` to avoid oversubscription. The
+  model is pickled via `torch.save` bytes (`__getstate__`).
 - **HDFS**: `--hdfs` puts the Parquet datasets under `/heisenbig/<out-name>/`; JSON and model
   artifacts stay local. After `--profile hdfs up`, run
   `docker compose exec namenode hdfs dfsadmin -safemode wait` before writing, or the namenode
