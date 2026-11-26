@@ -93,37 +93,137 @@ def test_reference_flux_weights():
     assert np.all(w >= 0) and w.sum() == pytest.approx(1.0)
 
 
+def _toy_mc_ctx(model, xs, e):
+    z0 = model.encode(xs)
+    return {
+        "rows": [("U235", 18), ("U235", 102)], "nu": {"U235": 2.4}, "densities": {"U235": 1.0},
+        "w": uq.collapse_weights(e, np.ones_like(e)), "batch_size": 5, "n_samples": 12, "seed": 7,
+        "model": model, "z0": z0, "code_std": np.ones(z0.shape[1]), "scale": 0.01,
+        "xs_rec": model.decode(z0), "xs_orig": xs, "f0": compress.to_features(xs),
+        "sigma_f": 0.003, "L": uq.corr_factor(np.log10(e), 0.5),
+    }
+
+
 def test_mc_batches_are_reproducible():
     e = grid.Grid(n=60).energies
     xs = np.vstack([np.full(60, 2.0), np.full(60, 1.0)])           # U235 MT18, MT102
     model = compress.PCACompressor(k=2, k_max=2).fit(np.vstack([xs, 1.5 * xs, 0.7 * xs]))
-    ctx = {
-        "rows": [("U235", 18), ("U235", 102)], "nu": {"U235": 2.4}, "densities": {"U235": 1.0},
-        "w": uq.collapse_weights(e, np.ones_like(e)), "batch_size": 5, "n_samples": 12, "seed": 7,
-        "z0": model.encode(xs), "components": model.components, "mean": model.mean,
-        "xs_rec": model.decode(model.encode(xs)), "xs_orig": xs, "f0": compress.to_features(xs),
-        "sigma_z": 0.01, "sigma_f": 0.003, "L": uq.corr_factor(np.log10(e), 0.5),
-    }
-    for method in ("latent", "full"):
+    ctx = _toy_mc_ctx(model, xs, e)
+    for method in ("latent_pca", "full"):
         a, b = uq.run_batch(1, ctx, method), uq.run_batch(1, ctx, method)
         assert a == b and len(a) == 5 and a[0][1] == 5
         assert len(uq.run_batch(2, ctx, method)) == 2              # last, partial batch
         assert all(0.9 < r[2] / 1.6 < 1.1 for r in a)               # nominal k = 2.4·2/3 = 1.6
 
 
+def test_latent_scale_calibration_hits_target():
+    rng = np.random.default_rng(1)
+    xs = compress.from_features(0.3 * rng.normal(size=(30, 4)) @ rng.normal(size=(4, 80)))
+    model = compress.PCACompressor(k=4, k_max=4).fit(xs)
+    z0 = model.encode(xs[:2])
+    c, measured = uq.calibrate_latent_scale(model, z0, model.encode(xs).std(0), model.decode(z0), 0.0075)
+    assert c > 0 and measured == pytest.approx(0.0075, rel=0.05)
+
+
+# --- stage 2: autoencoder option ------------------------------------------------
+
+def _threshold_curves(n_rows=48, n=64, seed=0):
+    """Toy 'cross sections': smooth power laws that are exactly 0 below a
+    row-specific threshold — the structure PCA handles badly."""
+    rng = np.random.default_rng(seed)
+    e = np.linspace(0, 1, n)
+    rows = []
+    for _ in range(n_rows):
+        thr, a, b = rng.uniform(0.1, 0.7), rng.uniform(0.5, 2), rng.uniform(-1, 1)
+        rows.append(np.where(e >= thr, a * 10 ** (b * e), 0.0))
+    return np.vstack(rows)
+
+
+def test_autoencoder_learns_zero_mask_and_round_trips(tmp_path):
+    import pickle
+
+    from heisenbig.autoencoder import AECompressor, AEConfig
+
+    X = _threshold_curves()
+    m = AECompressor(X.shape[1], 4, AEConfig(hidden=(64, 32), epochs=300, batch_size=16, eval_every=50))
+    info = m.fit(X[:40], X[40:], threads=1)
+    rec = m.decode(m.encode(X))
+    assert rec.shape == X.shape and np.all(rec >= 0)
+    assert ((rec > 0) == (X > 0)).mean() > 0.95                     # presence mask learned
+    assert np.any(rec == 0)                                          # true zeros, not ~EPS
+    assert 1 <= info["best_epoch"] <= 300
+    # persistence: torch file and pickle (how Spark ships it) decode identically
+    m.save(tmp_path / "ae.pt")
+    for clone in (AECompressor.load(tmp_path / "ae.pt"), pickle.loads(pickle.dumps(m))):
+        np.testing.assert_allclose(clone.decode(clone.encode(X)), rec)
+
+
+def test_autoencoder_init_is_seeded():
+    from heisenbig.autoencoder import AECompressor, AEConfig
+
+    import torch
+    torch.manual_seed(123)   # perturb global state: must not matter
+    a = AECompressor(16, 2, AEConfig(hidden=(8, 8)))
+    torch.manual_seed(456)
+    b = AECompressor(16, 2, AEConfig(hidden=(8, 8)))
+    for (_, pa), (_, pb) in zip(a.net.state_dict().items(), b.net.state_dict().items()):
+        assert torch.equal(pa, pb)
+
+
+def test_autoencoder_can_be_used_by_mc_worker():
+    from heisenbig.autoencoder import AECompressor, AEConfig
+
+    e = grid.Grid(n=64).energies
+    X = _threshold_curves(n=64)
+    m = AECompressor(64, 3, AEConfig(hidden=(32, 16), epochs=20, batch_size=16))
+    m.fit(X, threads=1)
+    ctx = _toy_mc_ctx(m, X[:2], e)
+    out = uq.run_batch(0, ctx, "latent_ae")
+    assert out == uq.run_batch(0, ctx, "latent_ae") and len(out) == 5
+
+
+def test_ray_sweep_runs_in_child_process():
+    from heisenbig.autoencoder import AEConfig, train_sweep
+
+    X = _threshold_curves()
+    res = train_sweep(X[:40], X[40:], [2, 3], AEConfig(hidden=(32, 16), epochs=10, batch_size=16), num_cpus=2)
+    assert sorted(res) == [2, 3]
+    for k, (m, info) in res.items():
+        assert m.k == k and m.decode(m.encode(X)).shape == X.shape
+
+
+def test_choose_k_tolerance_and_split():
+    rows = [{"k": 8, "v": 0.30}, {"k": 16, "v": 0.20}, {"k": 32, "v": 0.19}, {"k": 64, "v": 0.191}]
+    assert compress.choose_k_tolerance(rows, "v") == 16             # within 10 % of best (0.19)
+    assert compress.choose_k_tolerance(rows, "v", target=0.25) == 16
+    nucs = np.array(["U235", "U235", "H1", "Fe56", "O16", "Zr90"] * 5)
+    tr, va = compress.train_val_split(nucs, val_frac=0.2, force_train=["U235", "H1"])
+    assert len(np.intersect1d(tr, va)) == 0 and len(tr) + len(va) == len(nucs)
+    assert not np.isin(nucs[va], ["U235", "H1"]).any() and len(va) == 6
+
+
 # --- end to end ---------------------------------------------------------------
 
 @pytest.mark.skipif(not (RAW / "n-092_U_235.endf").exists(), reason="run scripts/download_endf.sh first")
-def test_quick_end_to_end(tmp_path):
+@pytest.mark.parametrize("compressor", ["pca", "ae"])
+def test_quick_end_to_end(tmp_path, compressor):
     from heisenbig import pipeline
+    from heisenbig.autoencoder import AEConfig
 
     s = pipeline.run(str(RAW), str(tmp_path / "out"), nuclides=["U235", "U238", "H1", "O16"],
-                     n_grid=200, n_samples=60, uq_cfg=uq.UQConfig(n_samples=60, batch_size=25))
+                     n_grid=200, n_samples=60, uq_cfg=uq.UQConfig(n_samples=60, batch_size=25),
+                     compressor=compressor, ae_cfg=AEConfig(epochs=10), ae_ks=(2, 4))
     out = tmp_path / "out"
-    for p in ("xs_long", "xs_wide", "uq/samples", "xs_wide_grid.json", "models/pca.joblib",
-              "pca_errors.json", "uq_summary.json", "run_summary.json"):
+    expected = ["xs_long", "xs_wide", "uq/samples", "xs_wide_grid.json", "models/pca.joblib",
+                "pca_errors.json", "uq_summary.json", "run_summary.json"]
+    if compressor == "ae":
+        expected += ["models/ae.pt", "compressor_comparison.json"]
+    for p in expected:
         assert (out / p).exists(), p
+    assert (out / "models/ae.pt").exists() == (compressor == "ae")
     assert s["stages"]["1_etl"]["failed"] == 0 and s["stages"]["1_etl"]["nuclides"] == 4
     assert s["stages"]["2_grid_compress"]["matrix_shape"][1] == 200
     mc = s["stages"]["3_uq"]["mc"]
-    assert all(np.isfinite(mc[m]["std"]) and mc[m]["std"] > 0 for m in ("latent", "full"))
+    methods = {"latent_pca", "full"} | ({"latent_ae"} if compressor == "ae" else set())
+    assert set(mc) == methods
+    assert all(np.isfinite(mc[m]["std"]) and mc[m]["std"] > 0 for m in methods)
