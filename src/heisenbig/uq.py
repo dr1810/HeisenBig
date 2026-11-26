@@ -10,13 +10,15 @@ with a fixed analytic reference flux φ(E) on the shared grid. Σ_a = capture
 Two sampling schemes, both distributed with Spark (one task per batch of samples,
 seeded per batch → reproducible regardless of partitioning):
 
-* ``latent`` — perturb the compressor's latent vectors of the reactor nuclides'
-  MT18/MT102 rows, decode, evaluate k_inf (centred on the reconstructed curves).
+* ``latent_<name>`` — for each compressor (PCA, optionally the autoencoder),
+  perturb the latent vectors of the reactor nuclides' MT18/MT102 rows, decode,
+  evaluate k_inf (centred on that compressor's reconstructed curves).
 * ``full``   — perturb log10(xs) directly on all N grid points with correlated
   Gaussian noise (squared-exponential kernel in log10 E), evaluate k_inf
   (centred on the original curves).
 
-Both noise levels are calibrated to the same RMS relative xs perturbation.
+All noise levels are calibrated to the same RMS relative xs perturbation
+(latent: empirically, since latent units are compressor-specific).
 
 CAVEAT: the thin pipeline uses ENDF MF=3 data, which holds only a background in
 the resolved resonance region, so absolute k_inf values are not physical yet.
@@ -175,17 +177,28 @@ def _rel_pert_rms(xs_pert: np.ndarray, xs_nom: np.ndarray) -> float:
     return float(np.sqrt(np.mean(rel ** 2)))
 
 
+_METHOD_SEED = {"latent_pca": 0, "full": 1, "latent_ae": 2}
+
+
 def run_batch(batch_id: int, ctx: dict, method: str) -> list[tuple]:
-    """Worker-side: one batch of MC samples → [(method, sample_id, k_inf, rel_pert_rms)]."""
+    """Worker-side: one batch of MC samples → [(method, sample_id, k_inf, rel_pert_rms)].
+
+    ``latent_*`` methods perturb z0 + c · s ∘ ε (s = per-dimension spread of the
+    training codes, c = calibrated scalar) and decode with ctx['model'] — any
+    Compressor. ``full`` perturbs log10(xs) with correlated noise on the grid."""
     n0 = batch_id * ctx["batch_size"]
     b = min(ctx["batch_size"], ctx["n_samples"] - n0)
-    rng = np.random.default_rng([ctx["seed"], 0 if method == "latent" else 1, batch_id])
+    code = _METHOD_SEED.get(method, sum(map(ord, method)))
+    rng = np.random.default_rng([ctx["seed"], code, batch_id])
     R = len(ctx["rows"])
-    if method == "latent":
+    if method.startswith("latent"):
+        model = ctx["model"]
+        if hasattr(model, "net"):          # torch model: one thread per Spark task, no oversubscription
+            import torch
+            torch.set_num_threads(1)
         z0 = ctx["z0"]                                       # [R, k]
-        z = z0[None] + ctx["sigma_z"] * rng.standard_normal((b, R, z0.shape[1]))
-        f = z.reshape(b * R, -1) @ ctx["components"] + ctx["mean"]
-        xs = from_features(f).reshape(b, R, -1)
+        z = z0[None] + ctx["scale"] * ctx["code_std"] * rng.standard_normal((b, R, z0.shape[1]))
+        xs = model.decode(z.reshape(b * R, -1)).reshape(b, R, -1)
         nom = ctx["xs_rec"]
     else:
         f0 = ctx["f0"]                                       # [R, N]
@@ -205,9 +218,35 @@ def corr_factor(log10_e: np.ndarray, corr_len: float) -> np.ndarray:
     return V * np.sqrt(np.clip(lam, 0.0, None))
 
 
-def run_uq(spark, meta, X: np.ndarray, energies: np.ndarray, model, raw_dir: str | Path,
-           out_uri: str, summary_path: str | Path, cfg: UQConfig = UQConfig()) -> dict:
-    """meta/X: wide table (from grid.load_wide); model: fitted Compressor."""
+def calibrate_latent_scale(model, z0: np.ndarray, code_std: np.ndarray, xs_rec: np.ndarray,
+                           target: float, seed: int = 0, n_cal: int = 32, iters: int = 5):
+    """Scalar c so that decoding z0 + c·s∘ε gives ~``target`` RMS relative xs
+    perturbation (fixed-point iteration on a fixed calibration draw). Works for any
+    compressor, whose latent units are otherwise arbitrary."""
+    rng = np.random.default_rng([seed, 99])
+    eps = rng.standard_normal((n_cal,) + z0.shape)
+    c, measured = 0.01, 0.0
+    for _ in range(iters):
+        xs = model.decode((z0[None] + c * code_std * eps).reshape(-1, z0.shape[1])).reshape(n_cal, *xs_rec.shape)
+        measured = float(np.mean([_rel_pert_rms(x, xs_rec) for x in xs]))
+        if measured <= 0:
+            c *= 10
+            continue
+        c *= target / measured
+    return c, measured
+
+
+def run_uq(spark, meta, X: np.ndarray, energies: np.ndarray, compressors, raw_dir: str | Path,
+           out_uri: str, summary_path: str | Path, cfg: UQConfig = UQConfig(),
+           code_std: dict | None = None) -> dict:
+    """meta/X: wide table (from grid.load_wide).
+
+    compressors: a fitted Compressor, or {name: Compressor} (e.g. {"pca": …, "ae": …}).
+    code_std: {name: per-dimension std of training codes}; defaults to the std of
+    the codes of all rows in X.
+    """
+    if not isinstance(compressors, dict):
+        compressors = {"pca": compressors}
     rows = [(n, mt) for n in cfg.densities for mt in FOM_MTS
             if ((meta["nuclide"] == n) & (meta["mt"] == mt)).any()]
     missing = [n for n in cfg.densities if n not in set(meta["nuclide"])]
@@ -215,8 +254,6 @@ def run_uq(spark, meta, X: np.ndarray, energies: np.ndarray, model, raw_dir: str
         raise ValueError(f"reactor nuclides missing from wide table: {missing}")
     idx = [int(np.flatnonzero((meta["nuclide"] == n) & (meta["mt"] == mt))[0]) for n, mt in rows]
     xs_orig = X[idx]                                       # [R, N]
-    z0 = model.encode(xs_orig)
-    xs_rec = model.decode(z0)
 
     nu, nu_src = {}, {}
     for n in cfg.densities:
@@ -225,54 +262,69 @@ def run_uq(spark, meta, X: np.ndarray, energies: np.ndarray, model, raw_dir: str
 
     phi = reference_flux(energies, cfg.flux)
     w = collapse_weights(energies, phi)
-    ctx = {
+    base = {
         "rows": rows, "nu": nu, "densities": cfg.densities, "w": w,
         "batch_size": cfg.batch_size, "n_samples": cfg.n_samples, "seed": cfg.seed,
-        "z0": z0, "components": model.components, "mean": model.mean,
-        "xs_rec": xs_rec, "xs_orig": xs_orig, "f0": to_features(xs_orig),
-        # same RMS relative perturbation in both spaces (d xs/xs ≈ ln10 · d log10 xs):
-        "sigma_z": cfg.target_rel_pert / math.log(10) * math.sqrt(len(energies) / model.k),
+        "xs_orig": xs_orig, "f0": to_features(xs_orig),
+        # full space: d xs/xs ≈ ln10 · d log10 xs
         "sigma_f": cfg.target_rel_pert / math.log(10),
     }
-    k_orig = float(_fom_from_rows(xs_orig[None], ctx)[0])
-    k_rec = float(_fom_from_rows(xs_rec[None], ctx)[0])
-    log.info("nominal k_inf: original %.5f | reconstructed (k=%d) %.5f", k_orig, model.k, k_rec)
+    k_orig = float(_fom_from_rows(xs_orig[None], base)[0])
+    log.info("nominal k_inf (original curves): %.5f", k_orig)
+
+    method_ctx, k_rec, latent_info = {}, {}, {}
+    for name, model in compressors.items():
+        z0 = model.encode(xs_orig)
+        xs_rec = model.decode(z0)
+        s = (code_std or {}).get(name)
+        if s is None:
+            s = model.encode(X).std(axis=0)
+        s = np.where(s > 0, s, 1.0)
+        c, measured = calibrate_latent_scale(model, z0, s, xs_rec, cfg.target_rel_pert, cfg.seed)
+        k_rec[name] = float(_fom_from_rows(xs_rec[None], base)[0])
+        latent_info[name] = {"k": int(model.k), "scale": c, "calibrated_rel_pert": measured}
+        method_ctx[f"latent_{name}"] = base | {"model": model, "z0": z0, "xs_rec": xs_rec,
+                                               "code_std": s, "scale": c}
+        log.info("nominal k_inf (%s, k=%d): %.5f | latent scale %.4g", name, model.k, k_rec[name], c)
+    method_ctx["full"] = base  # L added inside the timed section below
 
     from pyspark.sql import types as T
 
     sc = spark.sparkContext
     n_batches = math.ceil(cfg.n_samples / cfg.batch_size)
-    results, timings, dfs = {}, {}, []
+    results, dfs = {}, []
     schema = T.StructType([
         T.StructField("method", T.StringType()), T.StructField("sample_id", T.IntegerType()),
         T.StructField("k_inf", T.DoubleType()), T.StructField("rel_pert_rms", T.DoubleType()),
     ])
-    for method in ("latent", "full"):
+    for method, mctx in method_ctx.items():
         t0 = time.perf_counter()
-        mctx = dict(ctx)
         if method == "full":   # building the N×N factor is part of full-space cost
-            mctx["L"] = corr_factor(np.log10(energies), cfg.corr_len_decades)
+            mctx = mctx | {"L": corr_factor(np.log10(energies), cfg.corr_len_decades)}
         bc = sc.broadcast(mctx)
         out = (sc.parallelize(range(n_batches), n_batches)
-                 .flatMap(lambda b, m=method: run_batch(b, bc.value, m))
+                 .flatMap(lambda b, m=method, bc=bc: run_batch(b, bc.value, m))
                  .collect())
-        timings[method] = time.perf_counter() - t0
+        seconds = time.perf_counter() - t0
         bc.unpersist()
         ks = np.array([r[2] for r in out])
         results[method] = {
             "mean": float(ks.mean()), "std": float(ks.std(ddof=1)),
             "rel_pert_rms_mean": float(np.mean([r[3] for r in out])),
-            "seconds": round(timings[method], 2),
+            "seconds": round(seconds, 2),
         }
         dfs.append(spark.createDataFrame(out, schema))
         log.info("%s MC: %s", method, results[method])
 
-    dfs[0].unionByName(dfs[1]).write.mode("overwrite").partitionBy("method").parquet(out_uri)
+    union = dfs[0]
+    for d in dfs[1:]:
+        union = union.unionByName(d)
+    union.write.mode("overwrite").partitionBy("method").parquet(out_uri)
 
     summary = {
-        "k_inf_nominal_original": k_orig, "k_inf_nominal_reconstructed": k_rec, "latent_k": model.k,
-        "perturbed_rows": [f"{n}/MT{mt}" for n, mt in rows], "nu_source": nu_src,
-        "sigma_z": ctx["sigma_z"], "sigma_log10_full": ctx["sigma_f"],
+        "k_inf_nominal_original": k_orig, "k_inf_nominal_reconstructed": k_rec,
+        "latent": latent_info, "perturbed_rows": [f"{n}/MT{mt}" for n, mt in rows],
+        "nu_source": nu_src, "sigma_log10_full": base["sigma_f"],
         "config": asdict(cfg) | {"flux": asdict(cfg.flux)}, "mc": results,
     }
     Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
